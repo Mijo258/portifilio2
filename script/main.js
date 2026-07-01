@@ -6,8 +6,8 @@
   const COPPER   = 'rgba(32, 232, 109, 0.22)';
   const COPPER_B = 'rgba(49, 232, 32, 0.55)';
   const STEEL    = 'rgba(91, 143, 168, 0.15)';
-  const GRID     = 60; // grid cell size in px
-  const PAD_R    = 3;  // solder-pad radius
+  const GRID     = 60; 
+  const PAD_R    = 3;  
 
   let W, H, cols, rows;
 
@@ -29,10 +29,46 @@
   function snapX(x) { return Math.round(x / GRID) * GRID; }
   function snapY(y) { return Math.round(y / GRID) * GRID; }
 
-  function buildTraces() {
-    svg.innerHTML = '';
 
-    const dotGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+  const DRAW_DUR  = () => rnd(4.5, 7.0);   
+  const HOLD_DUR  = () => rnd(3.0, 8.0);   
+  const FADE_DUR  = 0.6;                    
+  const MAX_LIVE  = 35;                     
+  const SPAWN_MS  = 300;                    
+
+  let dotGroup = null;
+  let traceLayer = null;
+  let spawnInterval = null;
+
+  function injectKeyframes() {
+    if (document.getElementById('trace-keyframes')) return;
+    const style = document.createElement('style');
+    style.id = 'trace-keyframes';
+    style.textContent = `
+      @keyframes traceDraw {
+        from { stroke-dashoffset: var(--tlen); }
+        to   { stroke-dashoffset: 0; }
+      }
+      @keyframes traceHold {
+        from, to { opacity: 1; }
+      }
+      @keyframes traceFade {
+        from { opacity: 1; }
+        to   { opacity: 0; }
+      }
+      @keyframes padAppear {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function buildDotGrid() {
+    // Dot grid is static — drawn once, never cleared
+    if (dotGroup) dotGroup.remove();
+    dotGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     for (let c = 0; c <= cols; c++) {
       for (let r = 0; r <= rows; r++) {
         const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
@@ -45,97 +81,135 @@
     }
     svg.appendChild(dotGroup);
 
-    const traceGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    const padGroup   = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    // Persistent layer for live traces (sits above dot grid)
+    if (traceLayer) traceLayer.remove();
+    traceLayer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    svg.appendChild(traceLayer);
+  }
 
-    const numTraces = Math.floor((cols * rows) / 6);
+  function buildTracePath() {
+    // Generate a random right-angle trace path
+    let x = snapX(rnd(0, W));
+    let y = snapY(rnd(0, H));
+    const segments = Math.floor(rnd(2, 5));
+    let d = `M ${x} ${y}`;
+    let cx = x, cy = y;
+    const corners = [[cx, cy]];
 
-    for (let i = 0; i < numTraces; i++) {
-      // Pick a random grid origin
-      let x = snapX(rnd(0, W));
-      let y = snapY(rnd(0, H));
+    for (let s = 0; s < segments; s++) {
+      const horizontal = s % 2 === 0;
+      const len = GRID * Math.floor(rnd(1, 4));
+      const dir = Math.random() > 0.5 ? 1 : -1;
+      if (horizontal) { cx += len * dir; }
+      else            { cy += len * dir; }
+      cx = Math.max(-GRID, Math.min(W + GRID, cx));
+      cy = Math.max(-GRID, Math.min(H + GRID, cy));
+      d += ` L ${cx} ${cy}`;
+      if (s < segments - 1) corners.push([cx, cy]);
+    }
 
-      // Build a path with 2–4 right-angle segments
-      const segments = Math.floor(rnd(2, 5));
-      let d = `M ${x} ${y}`;
-      let cx = x, cy = y;
-      const pads = [[cx, cy]];
+    return { d, corners };
+  }
 
-      for (let s = 0; s < segments; s++) {
-        // Alternate horizontal / vertical
-        const horizontal = s % 2 === 0;
-        const len = GRID * Math.floor(rnd(1, 4));
-        const dir = Math.random() > 0.5 ? 1 : -1;
+  function spawnTrace() {
+    // Throttle: don't exceed MAX_LIVE elements in the layer
+    if (traceLayer && traceLayer.childElementCount >= MAX_LIVE * 2) return;
 
-        if (horizontal) {
-          cx += len * dir;
-        } else {
-          cy += len * dir;
-        }
+    const isHighlight = Math.random() < 0.08;
+    const isSteel     = !isHighlight && Math.random() < 0.2;
+    const color       = isHighlight ? COPPER_B : isSteel ? STEEL : COPPER;
+    const strokeW     = isHighlight ? 1.5 : 1;
 
-        // Keep inside viewport with some padding
-        cx = Math.max(-GRID, Math.min(W + GRID, cx));
-        cy = Math.max(-GRID, Math.min(H + GRID, cy));
+    const { d, corners } = buildTracePath();
 
-        d += ` L ${cx} ${cy}`;
-        if (s < segments - 1) pads.push([cx, cy]); // corner pad
+    // Wrap trace + its pads in a group so we can fade the whole thing out together
+    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+    // ── PATH ──
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', color);
+    path.setAttribute('stroke-width', strokeW);
+    path.setAttribute('stroke-linecap', 'square');
+
+    const totalLen = path.getTotalLength ? path.getTotalLength() : 200;
+    path.style.setProperty('--tlen', totalLen + 'px');
+    path.setAttribute('stroke-dasharray', totalLen);
+    path.setAttribute('stroke-dashoffset', totalLen);
+
+    const drawDur = DRAW_DUR();
+    const holdDur = HOLD_DUR();
+
+    // Draw in
+    path.style.animation = `traceDraw ${drawDur}s cubic-bezier(0.4,0,0.2,1) forwards`;
+    group.appendChild(path);
+
+    // ── CORNER PADS ── (appear when trace reaches them)
+    corners.forEach(([px, py], idx) => {
+      if (Math.random() < 0.6) {
+        const pad = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        pad.setAttribute('cx', px);
+        pad.setAttribute('cy', py);
+        pad.setAttribute('r', PAD_R);
+        pad.setAttribute('fill', 'none');
+        pad.setAttribute('stroke', color);
+        pad.setAttribute('stroke-width', '1');
+        // Stagger pad appearance across the draw duration
+        const padDelay = (drawDur * 0.15 * idx).toFixed(2);
+        pad.style.animation = `padAppear 0.25s ${padDelay}s ease forwards`;
+        pad.style.opacity = '0';
+        group.appendChild(pad);
       }
+    });
 
-      const isHighlight = Math.random() < 0.08; // ~8% are copper-bright
-      const isSteel     = !isHighlight && Math.random() < 0.2;
+    traceLayer.appendChild(group);
 
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', d);
-      path.setAttribute('fill', 'none');
-      path.setAttribute('stroke', isHighlight ? COPPER_B : isSteel ? STEEL : COPPER);
-      path.setAttribute('stroke-width', isHighlight ? 1.5 : 1);
-      path.setAttribute('stroke-linecap', 'square');
+    // ── LIFECYCLE: hold → fade → remove → respawn ──
+    const holdTimer = setTimeout(() => {
+      // Fade out the whole group
+      group.style.transition = `opacity ${FADE_DUR}s ease`;
+      group.style.opacity = '0';
 
-      // Animate the trace draw
-      const totalLen = path.getTotalLength ? path.getTotalLength() : 200;
-      path.setAttribute('stroke-dasharray', totalLen);
-      path.setAttribute('stroke-dashoffset', totalLen);
+      const removeTimer = setTimeout(() => {
+        group.remove();
+        // Immediately spawn a replacement so count stays stable
+        spawnTrace();
+      }, FADE_DUR * 1000);
 
-      const delay  = rnd(0, 4);
-      const dur    = rnd(2, 6);
-      path.style.animation = `traceDraw ${dur}s ${delay}s cubic-bezier(0.4,0,0.2,1) forwards`;
+      // Clean up if resize clears the layer before timer fires
+      group._removeTimer = removeTimer;
+    }, (drawDur + holdDur) * 1000);
 
-      traceGroup.appendChild(path);
+    group._holdTimer = holdTimer;
+  }
 
-      // Add solder pads at corners
-      pads.forEach(([px, py]) => {
-        if (Math.random() < 0.6) {
-          const pad = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-          pad.setAttribute('cx', px);
-          pad.setAttribute('cy', py);
-          pad.setAttribute('r', PAD_R);
-          pad.setAttribute('fill', 'none');
-          pad.setAttribute('stroke', isHighlight ? COPPER_B : COPPER);
-          pad.setAttribute('stroke-width', '1');
-          pad.style.opacity = '0';
-          pad.style.animation = `padFade 0.3s ${delay + dur * 0.8}s ease forwards`;
-          padGroup.appendChild(pad);
-        }
+  function startContinuousTraces() {
+    // Stop any existing spawner
+    if (spawnInterval) clearInterval(spawnInterval);
+
+    // Seed with an initial burst so the screen isn't empty
+    const initialCount = Math.min(MAX_LIVE, Math.floor((cols * rows) / 10));
+    for (let i = 0; i < initialCount; i++) {
+      // Stagger initial spawns slightly so they don't all expire together
+      setTimeout(spawnTrace, i * 80);
+    }
+
+    // Then keep topping up at a steady rate
+    spawnInterval = setInterval(spawnTrace, SPAWN_MS);
+  }
+
+  function buildTraces() {
+    // Clear any active timers on existing trace groups before wiping
+    if (traceLayer) {
+      traceLayer.querySelectorAll('g').forEach(g => {
+        clearTimeout(g._holdTimer);
+        clearTimeout(g._removeTimer);
       });
     }
-
-    svg.appendChild(traceGroup);
-    svg.appendChild(padGroup);
-
-    // Inject keyframes if not present
-    if (!document.getElementById('trace-keyframes')) {
-      const style = document.createElement('style');
-      style.id = 'trace-keyframes';
-      style.textContent = `
-        @keyframes traceDraw {
-          to { stroke-dashoffset: 0; }
-        }
-        @keyframes padFade {
-          to { opacity: 1; }
-        }
-      `;
-      document.head.appendChild(style);
-    }
+    buildDotGrid();
+    injectKeyframes();
+    startContinuousTraces();
   }
 
   // Rebuild on resize (debounced)
